@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>容器资源控制组模拟器</title>
+<style>
+  :root { --bg:#14171c; --panel:#1c2129; --line:#2a313c; --fg:#cfd8e3; --dim:#7d8a9a;
+          --cpu:#4fc3f7; --mem:#ba68c8; --io:#81c784; --warn:#ffb74d; --bad:#e57373; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 "PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:24px; align-items:baseline; }
+  header h1 { font-size:16px; margin:0; }
+  header span { color:var(--dim); }
+  main { display:flex; gap:12px; padding:12px 16px; align-items:flex-start; }
+  #tree { flex:1.4; min-width:620px; }
+  #detail { flex:1; position:sticky; top:12px; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border-radius:8px; overflow:hidden; }
+  th,td { padding:5px 8px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:normal; font-size:12px; }
+  tr.g { cursor:pointer; }
+  tr.g:hover { background:#232a35; }
+  tr.g.sel { background:#263144; }
+  tr.frozen { opacity:.55; }
+  .name { font-family:ui-monospace,monospace; }
+  .bar { position:relative; width:110px; height:12px; background:#10141a; border-radius:3px; overflow:hidden; display:inline-block; vertical-align:middle; }
+  .bar>i { position:absolute; left:0; top:0; bottom:0; background:var(--cpu); }
+  .bar.mem>i { background:var(--mem); }
+  .bar em { position:absolute; top:0; bottom:0; width:1px; background:var(--warn); }
+  .bar b { position:absolute; top:0; bottom:0; width:2px; background:var(--bad); }
+  .num { font-family:ui-monospace,monospace; font-size:12px; }
+  .dim { color:var(--dim); }
+  .chip { display:inline-block; min-width:44px; padding:0 5px; margin-right:3px; border-radius:3px; background:#10141a; font-family:ui-monospace,monospace; font-size:11px; text-align:center; }
+  .chip.ok { color:#9ccc65; } .chip.warn { color:var(--warn); } .chip.bad { color:var(--bad); }
+  button { background:#2a3442; color:var(--fg); border:1px solid var(--line); border-radius:4px; padding:2px 8px; cursor:pointer; font-size:12px; }
+  button:hover { background:#354154; }
+  canvas { width:100%; height:220px; background:#10141a; border-radius:6px; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; font-size:12px; color:var(--dim); }
+  .legend i { display:inline-block; width:10px; height:2px; margin-right:4px; vertical-align:middle; }
+  h3 { margin:4px 0 8px; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>容器资源控制组模拟器</h1>
+  <span id="clock"></span><span id="cpus"></span><span class="dim">点击组名查看压力曲线;压力值为 some/full 的 10 秒滑动平均(%)</span>
+</header>
+<main>
+  <div id="tree">
+    <table>
+      <thead><tr>
+        <th>控制组</th><th>权重</th><th>配额/周期</th><th>本周期CPU</th><th>节流 次/时长</th>
+        <th>内存用量</th><th>回收</th><th>OOM</th><th>压力 CPU</th><th>压力 内存</th><th>压力 IO</th><th></th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div id="detail">
+    <h3 id="dtitle">压力曲线(未选中)</h3>
+    <div class="legend" id="legend"></div>
+    <canvas id="chart" width="560" height="220"></canvas>
+    <div class="dim" id="dinfo"></div>
+  </div>
+</main>
+<script>
+const RES = ["cpu","mem","io"], KIND = ["some","full"];
+const COLORS = {cpu_some:"#4fc3f7",cpu_full:"#0277bd",mem_some:"#ba68c8",mem_full:"#7b1fa2",io_some:"#81c784",io_full:"#2e7d32"};
+const LABELS = {cpu_some:"CPU 部分",cpu_full:"CPU 全部",mem_some:"内存 部分",mem_full:"内存 全部",io_some:"IO 部分",io_full:"IO 全部"};
+let selected = null, hist = null, state = null;
+
+const fmtB = b => b<=0?"0":b>=(1<<30)?(b/(1<<30)).toFixed(1)+"G":b>=(1<<20)?(b/(1<<20)).toFixed(1)+"M":(b/1024).toFixed(0)+"K";
+const fmtUs = us => us>=1e6?(us/1e6).toFixed(1)+"s":(us/1e3).toFixed(0)+"ms";
+const chip = v => `<span class="chip ${v<10?'ok':v<40?'warn':'bad'}">${v.toFixed(0)}</span>`;
+
+async function refresh() {
+  state = await (await fetch("/api/state")).json();
+  document.getElementById("clock").textContent = "模拟时间 " + (state.nowUs/1e6).toFixed(1) + " s";
+  document.getElementById("cpus").textContent = state.numCpus + " 个处理器";
+  const rows = state.groups.map(g => {
+    const ind = "&nbsp;".repeat(g.depth*4) + (g.depth?"└ ":"");
+    const quota = g.quotaUs>0 ? `<span class="num">${fmtUs(g.quotaUs)}/${fmtUs(g.periodUs)}</span>` : '<span class="dim">不限</span>';
+    const cpuPct = g.quotaUs>0 ? Math.min(100, 100*g.periodUsedUs/g.quotaUs) : 0;
+    const cpuBar = g.quotaUs>0
+      ? `<span class="bar"><i style="width:${cpuPct}%"></i></span> <span class="num">${fmtUs(g.periodUsedUs)}</span>`
+      : `<span class="num">${fmtUs(g.periodUsedUs)}</span>`;
+    const thr = g.nrThrottled>0 ? `<span class="num">${g.nrThrottled} / ${fmtUs(g.throttledUs)}</span>` : '<span class="dim">-</span>';
+    const mm = g.memMax>0?g.memMax:(g.memHigh>0?g.memHigh*2:Math.max(g.memUsage,1));
+    const memPct = Math.min(100,100*g.memUsage/mm);
+    const hiMark = g.memHigh>0?`<em style="left:${100*g.memHigh/mm}%"></em>`:"";
+    const loMark = g.memLow>0?`<b style="left:${100*g.memLow/mm}%"></b>`:"";
+    const memBar = `<span class="bar mem"><i style="width:${memPct}%"></i>${hiMark}${loMark}</span> <span class="num">${fmtB(g.memUsage)}</span>`;
+    const psi = k => chip(g.psi[k].avg10);
+    const oom = g.events[4]>0?`<span class="chip bad">${g.events[4]}</span>`:'<span class="dim">0</span>';
+    const frz = g.effFrozen ? "解冻" : "冻结";
+    return `<tr class="g ${g.effFrozen?'frozen':''} ${selected===g.name?'sel':''}" data-n="${g.name}">
+      <td class="name">${ind}${g.name}${g.frozen?' ❄':''}</td><td class="num">${g.weight}</td><td>${quota}</td>
+      <td>${cpuBar}</td><td>${thr}</td><td>${memBar}</td>
+      <td class="num">${fmtB(g.reclaimedBytes)}</td><td>${oom}</td>
+      <td>${psi("cpu_some")}${psi("cpu_full")}</td><td>${psi("mem_some")}${psi("mem_full")}</td><td>${psi("io_some")}${psi("io_full")}</td>
+      <td><button onclick="freeze(event,'${g.name}',${g.effFrozen?0:1})">${frz}</button></td></tr>`;
+  }).join("");
+  document.getElementById("rows").innerHTML = rows;
+  document.querySelectorAll("tr.g").forEach(tr => tr.onclick = e => {
+    if (e.target.tagName==="BUTTON") return;
+    selected = tr.dataset.n; draw();
+  });
+  if (selected) draw();
+}
+
+async function freeze(ev, name, on) {
+  ev.stopPropagation();
+  await fetch(`/api/freeze?name=${name}&frozen=${on}`, {method:"POST"});
+  refresh();
+}
+
+async function refreshHist() {
+  hist = await (await fetch("/api/history")).json();
+  if (selected) draw();
+}
+
+function draw() {
+  if (!hist || !selected || !hist.groups[selected]) return;
+  document.getElementById("dtitle").textContent = "压力曲线:" + selected;
+  document.getElementById("legend").innerHTML = RES.flatMap(r=>KIND.map(k=>{
+    const key=r+"_"+k; return `<span><i style="background:${COLORS[key]}"></i>${LABELS[key]}</span>`;
+  })).join("");
+  const cv = document.getElementById("chart"), ctx = cv.getContext("2d");
+  const W = cv.width, H = cv.height, pad = 24;
+  ctx.clearRect(0,0,W,H);
+  const t = hist.t, n = t.length;
+  if (n < 2) return;
+  const series = hist.groups[selected];
+  let max = 10;
+  for (const key in series) for (const v of series[key]) if (v>max) max=v;
+  max = Math.min(100, max*1.1);
+  ctx.strokeStyle="#2a313c"; ctx.fillStyle="#7d8a9a"; ctx.font="10px monospace";
+  for (let y=0; y<=max; y+=Math.max(1,Math.round(max/4))) {
+    const py = H-pad-(H-2*pad)*y/max;
+    ctx.beginPath(); ctx.moveTo(pad,py); ctx.lineTo(W-4,py); ctx.stroke();
+    ctx.fillText(y.toFixed(0)+"%", 2, py+3);
+  }
+  for (const key in series) {
+    const s = series[key];
+    ctx.strokeStyle = COLORS[key]; ctx.lineWidth = key.endsWith("full")?1.8:1.2;
+    ctx.beginPath();
+    for (let i=0;i<n;i++) {
+      const x = pad+(W-pad-4)*i/(n-1), y = H-pad-(H-2*pad)*Math.min(s[i],max)/max;
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    }
+    ctx.stroke();
+  }
+  const g = state && state.groups.find(g=>g.name===selected);
+  if (g) document.getElementById("dinfo").textContent =
+    `存活任务 ${g.liveTasks}/${g.tasks} · 应得份额 ${g.entitlement.toFixed(2)} 核 · 累计CPU ${fmtUs(g.cpuTotalUs)} · 节流 ${g.nrThrottled} 次/${fmtUs(g.throttledUs)} · 内存事件 high=${g.events[1]} max=${g.events[2]} oom=${g.events[4]}`;
+}
+
+refresh(); refreshHist();
+setInterval(refresh, 1000);
+setInterval(refreshHist, 2000);
+</script>
+</body>
+</html>
